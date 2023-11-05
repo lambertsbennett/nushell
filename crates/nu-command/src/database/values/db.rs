@@ -4,11 +4,9 @@ use super::definitions::{
 };
 
 use nu_protocol::{CustomValue, PipelineData, Record, ShellError, Span, Spanned, Value};
-use duckdb::{types::ValueRef, Connection, Row};
+use duckdb::{self, types::ValueRef, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
@@ -25,12 +23,12 @@ pub struct DuckDBDatabase {
 }
 
 impl DuckDBDatabase {
-    pub fn new(path: &Path, conn: &Connection, ctrlc: Option<Arc<AtomicBool>>) -> Self {
+    pub fn new(path: PathBuf, conn: Connection, ctrlc: Option<Arc<AtomicBool>>) -> Self {
         Default::default()
     }
 
-    pub fn open_connection_in_memory() -> Result<Self, ShellError> {
-        let conn = Connection::open_in_memory().map_err(|err| {
+    pub fn open_connection_in_memory(ctrlc: Option<Arc<AtomicBool>>) -> Result<Self, ShellError> {
+        let conn: Connection = Connection::open_in_memory().map_err(|err| {
             ShellError::GenericError(
                 "Failed to open DuckDB connection in memory".into(),
                 err.to_string(),
@@ -39,7 +37,7 @@ impl DuckDBDatabase {
                 Vec::new(),
             )
         })?;
-        Ok(Self::new(path, conn, ctrlc));
+        Ok(Self::new(PathBuf::from(":memory:"), conn, ctrlc))
     }
 
     pub fn try_from_path(
@@ -48,8 +46,8 @@ impl DuckDBDatabase {
         ctrlc: Option<Arc<AtomicBool>>,
     ) -> Result<Self, ShellError> {
 
-        let conn = Connection.open_connection(path).map_err(|e| ShellError::ReadingFile(e.to_string(), span))?;
-        Ok(Self::new(path, conn, ctrlc));
+        let conn: Connection = Connection.open_connection(path).map_err(|e| ShellError::ReadingFile(e.to_string(), span))?;
+        Ok(Self::new(PathBuf::from(path), conn, ctrlc))
     }
 
     pub fn try_from_value(value: Value) -> Result<Self, ShellError> {
@@ -87,9 +85,7 @@ impl DuckDBDatabase {
     }
 
     pub fn query(&self, sql: &Spanned<String>, call_span: Span) -> Result<Value, ShellError> {
-        let db = open_sqlite_db(&self.path, call_span)?;
-
-        let stream = run_sql_query(db, sql, self.ctrlc.clone()).map_err(|e| {
+        let stream = run_sql_query(self, sql, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
                 "Failed to query SQLite database".into(),
                 e.to_string(),
@@ -277,7 +273,7 @@ impl CustomValue for DuckDBDatabase {
     }
 
     fn to_base_value(&self, span: Span) -> Result<Value, ShellError> {
-        read_entire_sqlite_db(self.conn, span, self.ctrlc.clone()).map_err(|e| {
+        read_entire_db(self, span, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
                 "Failed to read from SQLite database".into(),
                 e.to_string(),
@@ -319,21 +315,21 @@ impl CustomValue for DuckDBDatabase {
 }
 
 fn run_sql_query(
-    conn: Connection,
+    db: &DuckDBDatabase,
     sql: &Spanned<String>,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let stmt = conn.prepare(&sql.item)?;
+    let stmt: duckdb::Statement = db.conn.prepare(&sql.item)?;
     prepared_statement_to_nu_list(stmt, sql.span, ctrlc)
 }
 
 fn read_single_table(
-    conn: Connection,
+    db: &DuckDBDatabase,
     table_name: String,
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, rusqlite::Error> {
-    let stmt = conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
+    let stmt = db.conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
     prepared_statement_to_nu_list(stmt, call_span, ctrlc)
 }
 
@@ -374,19 +370,19 @@ fn prepared_statement_to_nu_list(
 }
 
 fn read_entire_db(
-    conn: Connection,
+    db: &DuckDBDatabase,
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let mut tables = Record::new();
+    let mut tables: duckdb::Record = Record::new();
 
     let mut get_table_names =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        db.conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
     let rows = get_table_names.query_map([], |row| row.get(0))?;
 
     for row in rows {
         let table_name: String = row?;
-        let table_stmt = conn.prepare(&format!("select * from [{table_name}]"))?;
+        let table_stmt = db.conn.prepare(&format!("select * from [{table_name}]"))?;
         let rows = prepared_statement_to_nu_list(table_stmt, call_span, ctrlc.clone())?;
         tables.push(table_name, rows);
     }
@@ -445,9 +441,9 @@ mod test {
 
     #[test]
     fn can_read_empty_table() {
-        let db = open_connection_in_memory().unwrap();
+        let db = DuckDBDatabase::open_connection_in_memory().unwrap();
 
-        db.execute(
+        db.conn.execute(
             "CREATE TABLE person (
                     id     INTEGER PRIMARY KEY,
                     name   TEXT NOT NULL,
@@ -456,7 +452,7 @@ mod test {
             [],
         )
         .unwrap();
-        let converted_db = read_entire_sqlite_db(db, Span::test_data(), None).unwrap();
+        let converted_db = read_entire_db(&db, Span::test_data(), None).unwrap();
 
         let expected = Value::test_record(record! {
             "person" => Value::test_list(vec![]),
