@@ -345,7 +345,7 @@ fn read_single_table(
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let stmt = conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
+    let stmt = conn.prepare(&format!("SELECT * FROM {table_name}"))?;
     prepared_statement_to_nu_list(stmt, call_span, ctrlc)
 }
 
