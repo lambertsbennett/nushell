@@ -5,37 +5,31 @@ use super::definitions::{
 
 use duckdb::{self, types::ValueRef, Connection, Row};
 use nu_protocol::{CustomValue, PipelineData, Record, ShellError, Span, Spanned, Value};
-// use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DuckDBDatabase {
-    pub conn: Connection,
-    // #[serde(skip)]
+    pub path: PathBuf,
+    #[serde(skip)]
     // this understandably can't be serialized. think that's OK, I'm not aware of a
     // reason why a CustomValue would be serialized outside of a plugin
     ctrlc: Option<Arc<AtomicBool>>,
 }
 
 impl DuckDBDatabase {
-    pub fn new(conn: Connection, ctrlc: Option<Arc<AtomicBool>>) -> Self {
-        Self { conn: conn, ctrlc }
+    pub fn new(path: &Path, ctrlc: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            path: PathBuf::from(path),
+            ctrlc,
+        }
     }
 
-    pub fn open_connection_in_memory(ctrlc: Option<Arc<AtomicBool>>) -> Result<Self, ShellError> {
-        let conn: Connection = Connection::open_in_memory().map_err(|err| {
-            ShellError::GenericError(
-                "Failed to open DuckDB connection in memory".into(),
-                err.to_string(),
-                Some(Span::test_data()),
-                None,
-                Vec::new(),
-            )
-        })?;
-        Ok(Self::new(conn, ctrlc))
+    pub fn open_connection(&self) -> Result<Connection, duckdb::Error> {
+        Connection::open(&self.path)
     }
 
     pub fn try_from_path(
@@ -43,9 +37,9 @@ impl DuckDBDatabase {
         span: Span,
         ctrlc: Option<Arc<AtomicBool>>,
     ) -> Result<Self, ShellError> {
-        let conn: Connection =
+        let _: Connection =
             Connection::open(path).map_err(|e| ShellError::ReadingFile(e.to_string(), span))?;
-        Ok(Self::new(conn, ctrlc))
+        Ok(DuckDBDatabase::new(path, ctrlc))
     }
 
     pub fn try_from_value(value: Value) -> Result<Self, ShellError> {
@@ -53,7 +47,7 @@ impl DuckDBDatabase {
         match value {
             Value::CustomValue { val, .. } => match val.as_any().downcast_ref::<Self>() {
                 Some(db) => Ok(Self {
-                    conn: db.conn.clone(),
+                    path: db.path.clone(),
                     ctrlc: db.ctrlc.clone(),
                 }),
                 None => Err(ShellError::CantConvert {
@@ -81,8 +75,14 @@ impl DuckDBDatabase {
         Value::custom_value(Box::new(self), span)
     }
 
-    pub fn query(&self, sql: &Spanned<String>, call_span: Span) -> Result<Value, ShellError> {
-        let stream = run_sql_query(self, sql, self.ctrlc.clone()).map_err(|e| {
+    pub fn query(
+        &self,
+        sql: &Spanned<String>,
+        call_span: Span,
+        ctrlc: Option<Arc<AtomicBool>>,
+    ) -> Result<Value, ShellError> {
+        let conn = open_duckdb(&self.path, call_span)?;
+        let stream = run_sql_query(conn, sql, ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
                 "Failed to query DuckDB database".into(),
                 e.to_string(),
@@ -95,10 +95,9 @@ impl DuckDBDatabase {
         Ok(stream)
     }
 
-    pub fn get_tables(&self) -> Result<Vec<DbTable>, duckdb::Error> {
-        let mut table_names = self
-            .conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    pub fn get_tables(conn: Connection) -> Result<Vec<DbTable>, duckdb::Error> {
+        let mut table_names =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
         let rows = table_names.query_map([], |row| row.get(0))?;
         let mut tables = Vec::new();
 
@@ -128,8 +127,12 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_columns(&self, table: &DbTable) -> Result<Vec<DbColumn>, duckdb::Error> {
-        let mut column_names = self.conn.prepare(&format!(
+    pub fn get_columns(
+        &self,
+        conn: Connection,
+        table: &DbTable,
+    ) -> Result<Vec<DbColumn>, duckdb::Error> {
+        let mut column_names = conn.prepare(&format!(
             "SELECT * FROM pragma_table_info('{}');",
             table.name
         ))?;
@@ -153,8 +156,12 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_constraints(&self, table: &DbTable) -> Result<Vec<DbConstraint>, duckdb::Error> {
-        let mut column_names = self.conn.prepare(&format!(
+    pub fn get_constraints(
+        &self,
+        conn: Connection,
+        table: &DbTable,
+    ) -> Result<Vec<DbConstraint>, duckdb::Error> {
+        let mut column_names = conn.prepare(&format!(
             "
             SELECT
                 p.origin,
@@ -191,8 +198,12 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_foreign_keys(&self, table: &DbTable) -> Result<Vec<DbForeignKey>, duckdb::Error> {
-        let mut column_names = self.conn.prepare(&format!(
+    pub fn get_foreign_keys(
+        &self,
+        conn: Connection,
+        table: &DbTable,
+    ) -> Result<Vec<DbForeignKey>, duckdb::Error> {
+        let mut column_names = conn.prepare(&format!(
             "SELECT p.`from`, p.`to`, p.`table` FROM pragma_foreign_key_list('{}') p",
             &table.name
         ))?;
@@ -216,8 +227,12 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_indexes(&self, table: &DbTable) -> Result<Vec<DbIndex>, duckdb::Error> {
-        let mut column_names = self.conn.prepare(&format!(
+    pub fn get_indexes(
+        &self,
+        conn: Connection,
+        table: &DbTable,
+    ) -> Result<Vec<DbIndex>, duckdb::Error> {
+        let mut column_names = conn.prepare(&format!(
             "
             SELECT
                 m.name AS index_name,
@@ -246,7 +261,7 @@ impl DuckDBDatabase {
 impl CustomValue for DuckDBDatabase {
     fn clone_value(&self, span: Span) -> Value {
         let cloned = DuckDBDatabase {
-            conn: self.conn.clone(),
+            path: self.path.clone(),
             ctrlc: self.ctrlc.clone(),
         };
 
@@ -258,7 +273,8 @@ impl CustomValue for DuckDBDatabase {
     }
 
     fn to_base_value(&self, span: Span) -> Result<Value, ShellError> {
-        read_entire_db(self, span, self.ctrlc.clone()).map_err(|e| {
+        let conn = open_duckdb(&self.path, span)?;
+        read_entire_db(conn, span, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
                 "Failed to read from DuckDB database".into(),
                 e.to_string(),
@@ -279,7 +295,8 @@ impl CustomValue for DuckDBDatabase {
     }
 
     fn follow_path_string(&self, _column_name: String, span: Span) -> Result<Value, ShellError> {
-        read_single_table(self.conn, _column_name, span, self.ctrlc.clone()).map_err(|e| {
+        let conn = open_duckdb(&self.path, span)?;
+        read_single_table(conn, _column_name, span, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
                 "Failed to read from DuckDB database".into(),
                 e.to_string(),
@@ -299,22 +316,36 @@ impl CustomValue for DuckDBDatabase {
     }
 }
 
+pub fn open_duckdb(path: &Path, call_span: Span) -> Result<Connection, nu_protocol::ShellError> {
+    let path = path.to_string_lossy().to_string();
+
+    Connection::open(path).map_err(|e| {
+        ShellError::GenericError(
+            "Failed to open SQLite database".into(),
+            e.to_string(),
+            Some(call_span),
+            None,
+            Vec::new(),
+        )
+    })
+}
+
 fn run_sql_query(
-    db: &DuckDBDatabase,
+    conn: Connection,
     sql: &Spanned<String>,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let stmt: duckdb::Statement = db.conn.prepare(&sql.item)?;
+    let stmt: duckdb::Statement = conn.prepare(&sql.item)?;
     prepared_statement_to_nu_list(stmt, sql.span, ctrlc)
 }
 
 fn read_single_table(
-    db: &DuckDBDatabase,
+    conn: Connection,
     table_name: String,
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let stmt = db.conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
+    let stmt = conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
     prepared_statement_to_nu_list(stmt, call_span, ctrlc)
 }
 
@@ -355,20 +386,19 @@ fn prepared_statement_to_nu_list(
 }
 
 fn read_entire_db(
-    db: &DuckDBDatabase,
+    conn: Connection,
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
     let mut tables: nu_protocol::Record = Record::new();
 
-    let mut get_table_names = db
-        .conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    let mut get_table_names =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
     let rows = get_table_names.query_map([], |row| row.get(0))?;
 
     for row in rows {
         let table_name: String = row?;
-        let table_stmt = db.conn.prepare(&format!("select * from [{table_name}]"))?;
+        let table_stmt = conn.prepare(&format!("select * from {table_name}"))?;
         let rows = prepared_statement_to_nu_list(table_stmt, call_span, ctrlc.clone())?;
         tables.push(table_name, rows);
     }
@@ -434,8 +464,8 @@ mod test {
 
     #[test]
     fn can_read_empty_db() {
-        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
-        let converted_db = read_entire_db(&db, Span::test_data(), None).unwrap();
+        let conn = open_connection_in_memory().unwrap();
+        let converted_db = read_entire_db(conn, Span::test_data(), None).unwrap();
 
         let expected = Value::test_record(Record::new());
 
@@ -444,19 +474,18 @@ mod test {
 
     #[test]
     fn can_read_empty_table() {
-        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
+        let conn = open_connection_in_memory().unwrap();
 
-        db.conn
-            .execute(
-                "CREATE TABLE person (
+        conn.execute(
+            "CREATE TABLE person (
                     id     INTEGER PRIMARY KEY,
                     name   TEXT NOT NULL,
                     data   BLOB
                     )",
-                [],
-            )
-            .unwrap();
-        let converted_db = read_entire_db(&db, Span::test_data(), None).unwrap();
+            [],
+        )
+        .unwrap();
+        let converted_db = read_entire_db(conn, Span::test_data(), None).unwrap();
 
         let expected = Value::test_record(record! {
             "person" => Value::test_list(vec![]),
@@ -468,27 +497,24 @@ mod test {
     #[test]
     fn can_read_null_and_non_null_data() {
         let span = Span::test_data();
-        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
+        let conn = open_connection_in_memory().unwrap();
 
-        db.conn
-            .execute(
-                "CREATE TABLE item (
+        conn.execute(
+            "CREATE TABLE item (
                     id     INTEGER PRIMARY KEY,
                     name   TEXT
                     )",
-                [],
-            )
+            [],
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO item (id, name) VALUES (123, NULL)", [])
             .unwrap();
 
-        db.conn
-            .execute("INSERT INTO item (id, name) VALUES (123, NULL)", [])
+        conn.execute("INSERT INTO item (id, name) VALUES (456, 'foo bar')", [])
             .unwrap();
 
-        db.conn
-            .execute("INSERT INTO item (id, name) VALUES (456, 'foo bar')", [])
-            .unwrap();
-
-        let converted_db = read_entire_db(&db, span, None).unwrap();
+        let converted_db = read_entire_db(conn, span, None).unwrap();
 
         let expected = Value::test_record(record! {
             "item" => Value::test_list(
@@ -506,5 +532,17 @@ mod test {
         });
 
         assert_eq!(converted_db, expected);
+    }
+
+    pub fn open_connection_in_memory() -> Result<Connection, ShellError> {
+        Connection::open_in_memory().map_err(|err| {
+            ShellError::GenericError(
+                "Failed to open DuckDB connection in memory".into(),
+                err.to_string(),
+                Some(Span::test_data()),
+                None,
+                Vec::new(),
+            )
+        })
     }
 }
