@@ -21,8 +21,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
 
         // Database-related
         // Adds all related commands to query databases
-        #[cfg(feature = "sqlite")]
-        add_database_decls(&mut working_set);
+        // #[cfg(feature = "sqlite")]
+        // add_database_decls(&mut working_set);
 
         // Charts
         bind_command! {

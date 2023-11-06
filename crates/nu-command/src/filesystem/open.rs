@@ -9,7 +9,7 @@ use nu_protocol::{
 use std::io::BufReader;
 
 #[cfg(feature = "sqlite")]
-use crate::database::SQLiteDatabase;
+use crate::database::DuckDBDatabase;
 
 #[cfg(feature = "sqlite")]
 use nu_protocol::IntoPipelineData;
@@ -135,7 +135,7 @@ impl Command for Open {
                 } else {
                     #[cfg(feature = "sqlite")]
                     if !raw {
-                        let res = SQLiteDatabase::try_from_path(path, arg_span, ctrlc.clone())
+                        let res = DuckDBDatabase::try_from_path(path, arg_span, ctrlc.clone())
                             .map(|db| db.into_value(call.head).into_pipeline_data());
 
                         if res.is_ok() {

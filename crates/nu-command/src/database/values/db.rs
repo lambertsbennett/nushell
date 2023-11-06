@@ -3,28 +3,26 @@ use super::definitions::{
     db_index::DbIndex, db_table::DbTable,
 };
 
-use nu_protocol::{CustomValue, PipelineData, Record, ShellError, Span, Spanned, Value};
 use duckdb::{self, types::ValueRef, Connection, Row};
-use serde::{Deserialize, Serialize};
+use nu_protocol::{CustomValue, PipelineData, Record, ShellError, Span, Spanned, Value};
+// use serde::{Deserialize, Serialize};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{atomic::AtomicBool, Arc},
 };
 
-
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug)]
 pub struct DuckDBDatabase {
-    pub path: Option<PathBuf>,
-    pub conn: Option<Connection>,
-    #[serde(skip)]
+    pub conn: Connection,
+    // #[serde(skip)]
     // this understandably can't be serialized. think that's OK, I'm not aware of a
     // reason why a CustomValue would be serialized outside of a plugin
     ctrlc: Option<Arc<AtomicBool>>,
 }
 
 impl DuckDBDatabase {
-    pub fn new(path: PathBuf, conn: Connection, ctrlc: Option<Arc<AtomicBool>>) -> Self {
-        Default::default()
+    pub fn new(conn: Connection, ctrlc: Option<Arc<AtomicBool>>) -> Self {
+        Self { conn: conn, ctrlc }
     }
 
     pub fn open_connection_in_memory(ctrlc: Option<Arc<AtomicBool>>) -> Result<Self, ShellError> {
@@ -37,7 +35,7 @@ impl DuckDBDatabase {
                 Vec::new(),
             )
         })?;
-        Ok(Self::new(PathBuf::from(":memory:"), conn, ctrlc))
+        Ok(Self::new(conn, ctrlc))
     }
 
     pub fn try_from_path(
@@ -45,9 +43,9 @@ impl DuckDBDatabase {
         span: Span,
         ctrlc: Option<Arc<AtomicBool>>,
     ) -> Result<Self, ShellError> {
-
-        let conn: Connection = Connection.open_connection(path).map_err(|e| ShellError::ReadingFile(e.to_string(), span))?;
-        Ok(Self::new(PathBuf::from(path), conn, ctrlc))
+        let conn: Connection =
+            Connection::open(path).map_err(|e| ShellError::ReadingFile(e.to_string(), span))?;
+        Ok(Self::new(conn, ctrlc))
     }
 
     pub fn try_from_value(value: Value) -> Result<Self, ShellError> {
@@ -55,7 +53,6 @@ impl DuckDBDatabase {
         match value {
             Value::CustomValue { val, .. } => match val.as_any().downcast_ref::<Self>() {
                 Some(db) => Ok(Self {
-                    path: db.path.clone(),
                     conn: db.conn.clone(),
                     ctrlc: db.ctrlc.clone(),
                 }),
@@ -87,7 +84,7 @@ impl DuckDBDatabase {
     pub fn query(&self, sql: &Spanned<String>, call_span: Span) -> Result<Value, ShellError> {
         let stream = run_sql_query(self, sql, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
-                "Failed to query SQLite database".into(),
+                "Failed to query DuckDB database".into(),
                 e.to_string(),
                 Some(sql.span),
                 None,
@@ -99,8 +96,9 @@ impl DuckDBDatabase {
     }
 
     pub fn get_tables(&self) -> Result<Vec<DbTable>, duckdb::Error> {
-        let mut table_names =
-            self.conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        let mut table_names = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
         let rows = table_names.query_map([], |row| row.get(0))?;
         let mut tables = Vec::new();
 
@@ -130,10 +128,7 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_columns(
-        &self,
-        table: &DbTable,
-    ) -> Result<Vec<DbColumn>, rusqlite::Error> {
+    pub fn get_columns(&self, table: &DbTable) -> Result<Vec<DbColumn>, duckdb::Error> {
         let mut column_names = self.conn.prepare(&format!(
             "SELECT * FROM pragma_table_info('{}');",
             table.name
@@ -158,10 +153,7 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_constraints(
-        &self,
-        table: &DbTable,
-    ) -> Result<Vec<DbConstraint>, duckdb::Error> {
+    pub fn get_constraints(&self, table: &DbTable) -> Result<Vec<DbConstraint>, duckdb::Error> {
         let mut column_names = self.conn.prepare(&format!(
             "
             SELECT
@@ -199,10 +191,7 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_foreign_keys(
-        &self,
-        table: &DbTable,
-    ) -> Result<Vec<DbForeignKey>, duckdb::Error> {
+    pub fn get_foreign_keys(&self, table: &DbTable) -> Result<Vec<DbForeignKey>, duckdb::Error> {
         let mut column_names = self.conn.prepare(&format!(
             "SELECT p.`from`, p.`to`, p.`table` FROM pragma_foreign_key_list('{}') p",
             &table.name
@@ -227,10 +216,7 @@ impl DuckDBDatabase {
         Ok(dbc)
     }
 
-    pub fn get_indexes(
-        &self,
-        table: &DbTable,
-    ) -> Result<Vec<DbIndex>, duckdb::Error> {
+    pub fn get_indexes(&self, table: &DbTable) -> Result<Vec<DbIndex>, duckdb::Error> {
         let mut column_names = self.conn.prepare(&format!(
             "
             SELECT
@@ -260,7 +246,6 @@ impl DuckDBDatabase {
 impl CustomValue for DuckDBDatabase {
     fn clone_value(&self, span: Span) -> Value {
         let cloned = DuckDBDatabase {
-            path: self.path.clone(),
             conn: self.conn.clone(),
             ctrlc: self.ctrlc.clone(),
         };
@@ -275,7 +260,7 @@ impl CustomValue for DuckDBDatabase {
     fn to_base_value(&self, span: Span) -> Result<Value, ShellError> {
         read_entire_db(self, span, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
-                "Failed to read from SQLite database".into(),
+                "Failed to read from DuckDB database".into(),
                 e.to_string(),
                 Some(span),
                 None,
@@ -290,13 +275,13 @@ impl CustomValue for DuckDBDatabase {
 
     fn follow_path_int(&self, _count: usize, span: Span) -> Result<Value, ShellError> {
         // In theory we could support this, but tables don't have an especially well-defined order
-        Err(ShellError::IncompatiblePathAccess { type_name: "SQLite databases do not support integer-indexed access. Try specifying a table name instead".into(), span })
+        Err(ShellError::IncompatiblePathAccess { type_name: "DuckDB databases do not support integer-indexed access. Try specifying a table name instead".into(), span })
     }
 
     fn follow_path_string(&self, _column_name: String, span: Span) -> Result<Value, ShellError> {
         read_single_table(self.conn, _column_name, span, self.ctrlc.clone()).map_err(|e| {
             ShellError::GenericError(
-                "Failed to read from SQLite database".into(),
+                "Failed to read from DuckDB database".into(),
                 e.to_string(),
                 Some(span),
                 None,
@@ -328,7 +313,7 @@ fn read_single_table(
     table_name: String,
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
-) -> Result<Value, rusqlite::Error> {
+) -> Result<Value, duckdb::Error> {
     let stmt = db.conn.prepare(&format!("SELECT * FROM [{table_name}]"))?;
     prepared_statement_to_nu_list(stmt, call_span, ctrlc)
 }
@@ -374,10 +359,11 @@ fn read_entire_db(
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
-    let mut tables: duckdb::Record = Record::new();
+    let mut tables: nu_protocol::Record = Record::new();
 
-    let mut get_table_names =
-        db.conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    let mut get_table_names = db
+        .conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
     let rows = get_table_names.query_map([], |row| row.get(0))?;
 
     for row in rows {
@@ -407,11 +393,27 @@ pub fn convert_db_row_to_nu_value(row: &Row, span: Span, column_names: Vec<Strin
     )
 }
 
+// This needs work, there are way more types in duckdb then in Nu
 pub fn convert_db_value_to_nu_value(value: ValueRef, span: Span) -> Value {
     match value {
         ValueRef::Null => Value::nothing(span),
-        ValueRef::Integer(i) => Value::int(i, span),
-        ValueRef::Real(f) => Value::float(f, span),
+        ValueRef::UTinyInt(i) => Value::int(i.into(), span),
+        ValueRef::TinyInt(i) => Value::int(i.into(), span),
+        ValueRef::USmallInt(i) => Value::int(i.into(), span),
+        ValueRef::SmallInt(i) => Value::int(i.into(), span),
+        ValueRef::UInt(i) => Value::int(i.into(), span),
+        ValueRef::Int(i) => Value::int(i.into(), span),
+        //ValueRef::UBigInt(i) => Value::int(i.into(), span),
+        ValueRef::BigInt(i) => Value::int(i, span),
+        //ValueRef::UBigInt(i) => Value::int(i.into(), span),
+        //ValueRef::HugeInt(i) => Value::int(i.into(), span),
+        ValueRef::Float(f) => Value::float(f.into(), span),
+        //ValueRef::Double(f) => Value::float(f, span),
+        //ValueRef::Decimal(f) => Value::float(f.into(), span),
+        ValueRef::Boolean(b) => Value::bool(b, span),
+        //ValueRef::Date32(d) => Value::date(d.into(), span),
+        //ValueRef::Time64(t, i) => Value::int(i, span),
+        //ValueRef::Timestamp(t, i) => Value::int(i, span),
         ValueRef::Text(buf) => {
             let s = match std::str::from_utf8(buf) {
                 Ok(v) => v,
@@ -420,6 +422,7 @@ pub fn convert_db_value_to_nu_value(value: ValueRef, span: Span) -> Value {
             Value::string(s.to_string(), span)
         }
         ValueRef::Blob(u) => Value::binary(u.to_vec(), span),
+        _ => Value::nothing(span),
     }
 }
 
@@ -431,8 +434,8 @@ mod test {
 
     #[test]
     fn can_read_empty_db() {
-        let db = open_connection_in_memory().unwrap();
-        let converted_db = read_entire_db(db, Span::test_data(), None).unwrap();
+        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
+        let converted_db = read_entire_db(&db, Span::test_data(), None).unwrap();
 
         let expected = Value::test_record(Record::new());
 
@@ -441,17 +444,18 @@ mod test {
 
     #[test]
     fn can_read_empty_table() {
-        let db = DuckDBDatabase::open_connection_in_memory().unwrap();
+        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
 
-        db.conn.execute(
-            "CREATE TABLE person (
+        db.conn
+            .execute(
+                "CREATE TABLE person (
                     id     INTEGER PRIMARY KEY,
                     name   TEXT NOT NULL,
                     data   BLOB
                     )",
-            [],
-        )
-        .unwrap();
+                [],
+            )
+            .unwrap();
         let converted_db = read_entire_db(&db, Span::test_data(), None).unwrap();
 
         let expected = Value::test_record(record! {
@@ -464,24 +468,27 @@ mod test {
     #[test]
     fn can_read_null_and_non_null_data() {
         let span = Span::test_data();
-        let db = open_connection_in_memory().unwrap();
+        let db = DuckDBDatabase::open_connection_in_memory(None).unwrap();
 
-        db.execute(
-            "CREATE TABLE item (
+        db.conn
+            .execute(
+                "CREATE TABLE item (
                     id     INTEGER PRIMARY KEY,
                     name   TEXT
                     )",
-            [],
-        )
-        .unwrap();
-
-        db.execute("INSERT INTO item (id, name) VALUES (123, NULL)", [])
+                [],
+            )
             .unwrap();
 
-        db.execute("INSERT INTO item (id, name) VALUES (456, 'foo bar')", [])
+        db.conn
+            .execute("INSERT INTO item (id, name) VALUES (123, NULL)", [])
             .unwrap();
 
-        let converted_db = read_entire_db(db, span, None).unwrap();
+        db.conn
+            .execute("INSERT INTO item (id, name) VALUES (456, 'foo bar')", [])
+            .unwrap();
+
+        let converted_db = read_entire_db(&db, span, None).unwrap();
 
         let expected = Value::test_record(record! {
             "item" => Value::test_list(
@@ -501,4 +508,3 @@ mod test {
         assert_eq!(converted_db, expected);
     }
 }
-

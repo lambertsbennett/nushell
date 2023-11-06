@@ -56,8 +56,5 @@ pub use strings::*;
 pub use system::*;
 pub use viewers::*;
 
-#[cfg(feature = "sqlite")]
 mod database;
-
-#[cfg(feature = "sqlite")]
 pub use database::*;
