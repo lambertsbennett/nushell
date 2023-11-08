@@ -96,17 +96,47 @@ impl DuckDBDatabase {
     }
 
     pub fn init_cloud(
-        conn: Connection,
-        conn_type: &str,
-        conn_str: Option<&str>,
-    ) -> Result<usize, duckdb::Error> {
-        match conn_type {
-            "azure" => conn.execute(
-                "INSTALL azure; LOAD azure; SET azure_storage_connection_string = '(?)';",
-                params![conn_str],
-            ),
-            "aws" => conn.execute("CALL load_aws_credentials('?');", params![conn_str]),
-            _ => Err(duckdb::Error::InvalidQuery),
+        &self,
+        conn_type: Spanned<String>,
+        conn_str: Option<Spanned<String>>,
+        call_span: Span,
+    ) -> Result<usize, ShellError> {
+        let conn = open_duckdb(&self.path, call_span)?;
+        let conn_id = if let Some(conn_id) = conn_str {
+            conn_id.item
+        } else {
+            "".to_string()
+        };
+        match conn_type.item.as_str() {
+            "azure" => conn
+                .execute(
+                    "INSTALL azure; LOAD azure; SET azure_storage_connection_string = '(?)';",
+                    params![conn_id],
+                )
+                .map_err(|e| {
+                    ShellError::GenericError(
+                        "Failed to initiate cloud connection".into(),
+                        e.to_string(),
+                        Some(conn_type.span),
+                        None,
+                        Vec::new(),
+                    )
+                }),
+            "aws" => conn
+                .execute("CALL load_aws_credentials('?');", params![conn_id])
+                .map_err(|e| {
+                    ShellError::GenericError(
+                        "Failed to initiate cloud connection".into(),
+                        e.to_string(),
+                        Some(conn_type.span),
+                        None,
+                        Vec::new(),
+                    )
+                }),
+            _ => Err(ShellError::DidYouMean(
+                String::from("[azure, aws]"),
+                call_span,
+            )),
         }
     }
 
