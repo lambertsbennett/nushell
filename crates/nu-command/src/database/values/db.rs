@@ -3,7 +3,7 @@ use super::definitions::{
     db_index::DbIndex, db_table::DbTable,
 };
 
-use duckdb::{self, types::ValueRef, Connection, Row};
+use duckdb::{self, params, types::ValueRef, Connection, Row};
 use nu_protocol::{CustomValue, PipelineData, Record, ShellError, Span, Spanned, Value};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -93,6 +93,21 @@ impl DuckDBDatabase {
         })?;
 
         Ok(stream)
+    }
+
+    pub fn init_cloud(
+        conn: Connection,
+        conn_type: &str,
+        conn_str: Option<&str>,
+    ) -> Result<usize, duckdb::Error> {
+        match conn_type {
+            "azure" => conn.execute(
+                "INSTALL azure; LOAD azure; SET azure_storage_connection_string = '(?)';",
+                params![conn_str],
+            ),
+            "aws" => conn.execute("CALL load_aws_credentials('?');", params![conn_str]),
+            _ => Err(duckdb::Error::InvalidQuery),
+        }
     }
 
     pub fn get_tables(conn: Connection) -> Result<Vec<DbTable>, duckdb::Error> {
