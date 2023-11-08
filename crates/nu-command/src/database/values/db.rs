@@ -321,7 +321,7 @@ pub fn open_duckdb(path: &Path, call_span: Span) -> Result<Connection, nu_protoc
 
     Connection::open(path).map_err(|e| {
         ShellError::GenericError(
-            "Failed to open SQLite database".into(),
+            "Failed to open DuckDB database".into(),
             e.to_string(),
             Some(call_span),
             None,
@@ -354,6 +354,7 @@ fn prepared_statement_to_nu_list(
     call_span: Span,
     ctrlc: Option<Arc<AtomicBool>>,
 ) -> Result<Value, duckdb::Error> {
+    let _ = stmt.query([]);
     let column_names = stmt
         .column_names()
         .iter()
@@ -452,7 +453,18 @@ pub fn convert_db_value_to_nu_value(value: ValueRef, span: Span) -> Value {
             Value::string(s.to_string(), span)
         }
         ValueRef::Blob(u) => Value::binary(u.to_vec(), span),
-        _ => Value::nothing(span),
+        _ => {
+            return Value::error(
+                ShellError::GenericError(
+                    String::from("Problem converting to Nu type."),
+                    String::from("Problem converting to Nu Type."),
+                    Some(span),
+                    None,
+                    Vec::new(),
+                ),
+                span,
+            )
+        }
     }
 }
 
