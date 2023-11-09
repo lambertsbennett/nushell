@@ -110,7 +110,7 @@ impl DuckDBDatabase {
         match conn_type.item.as_str() {
             "azure" => conn
                 .execute(
-                    "INSTALL azure; LOAD azure; SET azure_storage_connection_string = '(?)';",
+                    "INSTALL azure; LOAD azure; SET azure_storage_connection_string = '?';",
                     params![conn_id],
                 )
                 .map_err(|e| {
